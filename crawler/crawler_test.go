@@ -325,3 +325,66 @@ func TestAnalyzeRecordsABrokenLink(t *testing.T) {
 		t.Fatal("the broken link is missing from the report")
 	}
 }
+
+// clientTimingOut never answers: it waits for the request's own deadline and
+// then reports it, the way a real client does on a slow host.
+func clientTimingOut() *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+}
+
+func TestAnalyzeRecordsAServerError(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/boom",
+		HTTPClient: clientReturning(http.StatusInternalServerError, "", nil),
+	})
+
+	page := report.Pages[0]
+	if page.HTTPStatus != http.StatusInternalServerError || page.Status != "failed" || page.Error == "" {
+		t.Fatalf("page = %+v", page)
+	}
+}
+
+func TestAnalyzeRecordsATimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	raw, err := crawler.Analyze(ctx, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientTimingOut(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var report crawler.Report
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+
+	page := report.Pages[0]
+	if page.Status != "failed" || page.Error == "" {
+		t.Fatalf("page = %+v", page)
+	}
+
+	if !strings.Contains(page.Error, "deadline exceeded") && !strings.Contains(page.Error, "context") {
+		t.Fatalf("error = %q, want it to name the timeout", page.Error)
+	}
+}
+
+func TestAnalyzeNeverTouchesTheDefaultClient(t *testing.T) {
+	// The whole point of passing a client in: if the crawler ever reached for
+	// the package-level one, this stub would not see the request at all.
+	var calls []*http.Request
+
+	analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, "", &calls),
+	})
+
+	if len(calls) != 1 {
+		t.Fatalf("the injected client saw %d requests, want 1", len(calls))
+	}
+}
