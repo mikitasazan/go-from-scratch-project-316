@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,6 +23,11 @@ const (
 
 	statusOK     = "ok"
 	statusFailed = "failed"
+
+	// retryPause is the wait before another attempt. It is deliberately not
+	// zero: repeating instantly is another burst at a server that is already
+	// struggling.
+	retryPause = 200 * time.Millisecond
 )
 
 // ErrNoURL is returned when Options carries no address to start from.
@@ -123,14 +129,30 @@ func newCrawl(opts Options) *crawl {
 	}
 }
 
-// request performs one HTTP call, retrying a request that never reached the
-// server. A refusal from the server is an answer, not something to retry.
+// temporary says whether a status code is worth asking about again. A 404 will
+// still be a 404 on the second try; an overloaded server may not be.
+func temporary(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+// request performs one HTTP call, repeating it up to Retries more times while
+// the problem looks temporary — a request that never reached the server, or a
+// server that said it is overloaded. Any other answer is returned as it is.
 func (c *crawl) request(ctx context.Context, method, address string) (*http.Response, error) {
-	var lastErr error
+	var (
+		lastResponse *http.Response
+		lastErr      error
+	)
 
 	for attempt := 0; attempt <= c.opts.Retries; attempt++ {
+		if attempt > 0 {
+			if err := pause(ctx, retryPause); err != nil {
+				break
+			}
+		}
+
 		if err := c.limiter.wait(ctx); err != nil {
-			return nil, err
+			break
 		}
 
 		request, err := http.NewRequestWithContext(ctx, method, address, nil)
@@ -143,14 +165,47 @@ func (c *crawl) request(ctx context.Context, method, address string) (*http.Resp
 		}
 
 		response, err := c.client.Do(request)
-		if err == nil {
+		if err != nil {
+			lastResponse, lastErr = nil, err
+			continue
+		}
+
+		if !temporary(response.StatusCode) {
 			return response, nil
 		}
 
-		lastErr = err
+		// The body of an attempt that will be repeated is of no use, and
+		// leaving it open would hold the connection.
+		_ = response.Body.Close()
+
+		lastResponse, lastErr = response, nil
+	}
+
+	if lastResponse != nil {
+		// The last attempt's answer is what the report shows. Its body is
+		// already closed, so hand back an empty one in its place.
+		lastResponse.Body = io.NopCloser(strings.NewReader(""))
+		return lastResponse, nil
+	}
+
+	if lastErr == nil {
+		lastErr = ctx.Err()
 	}
 
 	return nil, lastErr
+}
+
+// pause waits, unless the run is cancelled first.
+func pause(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // visit fetches one page of the site. A failure is a fact about the page, not a

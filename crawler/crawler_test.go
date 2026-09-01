@@ -680,3 +680,149 @@ func TestCancellingStopsTheWaitAtOnce(t *testing.T) {
 		t.Fatalf("cancelling left the crawl waiting for %v", elapsed)
 	}
 }
+
+// scriptedClient answers with the given statuses in order, then repeats the
+// last one. A status of 0 means "the request never got through".
+func scriptedClient(statuses []int, attempts *int32) *http.Client {
+	var i int32
+
+	return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		n := int(atomic.AddInt32(&i, 1)) - 1
+		if attempts != nil {
+			atomic.AddInt32(attempts, 1)
+		}
+
+		status := statuses[min(n, len(statuses)-1)]
+		if status == 0 {
+			return nil, errors.New("connection refused")
+		}
+
+		header := make(http.Header)
+		header.Set("Content-Type", "text/html")
+
+		return &http.Response{
+			Status:     http.StatusText(status),
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     header,
+		}, nil
+	})}
+}
+
+func TestRetriesRecoverFromATemporaryFailure(t *testing.T) {
+	var attempts int32
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: scriptedClient([]int{http.StatusServiceUnavailable, http.StatusOK}, &attempts),
+	})
+
+	page := report.Pages[0]
+	if page.Status != "ok" || page.HTTPStatus != http.StatusOK {
+		t.Fatalf("page = %+v", page)
+	}
+
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("made %d attempts, want 2", got)
+	}
+}
+
+func TestRetriesGiveUpAfterTheLimit(t *testing.T) {
+	var attempts int32
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: scriptedClient([]int{http.StatusInternalServerError}, &attempts),
+	})
+
+	page := report.Pages[0]
+	if page.Status != "failed" || page.HTTPStatus != http.StatusInternalServerError {
+		t.Fatalf("page = %+v", page)
+	}
+
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("made %d attempts, want retries+1 = 3", got)
+	}
+}
+
+func TestAPermanentAnswerIsNotRetried(t *testing.T) {
+	var attempts int32
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    3,
+		HTTPClient: scriptedClient([]int{http.StatusNotFound}, &attempts),
+	})
+
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("a 404 was asked %d times, want once", got)
+	}
+
+	if report.Pages[0].HTTPStatus != http.StatusNotFound {
+		t.Fatalf("page = %+v", report.Pages[0])
+	}
+}
+
+func TestTooManyRequestsIsRetried(t *testing.T) {
+	var attempts int32
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    1,
+		HTTPClient: scriptedClient([]int{http.StatusTooManyRequests, http.StatusOK}, &attempts),
+	})
+
+	if report.Pages[0].Status != "ok" {
+		t.Fatalf("page = %+v", report.Pages[0])
+	}
+
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("made %d attempts, want 2", got)
+	}
+}
+
+func TestRetriesWaitBetweenAttempts(t *testing.T) {
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: scriptedClient([]int{0}, nil),
+	})
+
+	// Two waits between three attempts; anything instant would be a burst.
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("three attempts took %v — they were not spaced out", elapsed)
+	}
+}
+
+func TestCancellingStopsFurtherAttempts(t *testing.T) {
+	var attempts int32
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+
+	if _, err := crawler.Analyze(ctx, crawler.Options{
+		URL:        "https://example.com",
+		Retries:    20,
+		HTTPClient: scriptedClient([]int{0}, &attempts),
+	}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("attempts kept going for %v after the cancel", elapsed)
+	}
+
+	if got := atomic.LoadInt32(&attempts); got > 5 {
+		t.Fatalf("made %d attempts after the cancel", got)
+	}
+}
