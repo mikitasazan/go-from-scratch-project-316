@@ -1140,3 +1140,49 @@ func TestIndentJSONChangesOnlyTheSpacing(t *testing.T) {
 		t.Fatalf("the two forms carry different documents.\nindented, compacted:\n%s\nplain:\n%s", compacted.Bytes(), plain)
 	}
 }
+
+func TestAnalyzeOrdersPagesByDepthThenAddress(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com",
+		Depth: 3,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com": {status: http.StatusOK, body: `
+				<a href="/posts/second.html">2</a>
+				<a href="/feed.xml">f</a>
+				<a href="/archive.html">a</a>`},
+			"https://example.com/posts/second.html": {status: http.StatusOK, body: `<a href="/posts/deep.html">d</a>`},
+			"https://example.com/posts/deep.html":   {status: http.StatusOK, body: ""},
+			"https://example.com/feed.xml":          {status: http.StatusOK, body: ""},
+			"https://example.com/archive.html":      {status: http.StatusOK, body: ""},
+		}, nil),
+	})
+
+	want := []string{
+		"https://example.com",
+		"https://example.com/archive.html",
+		"https://example.com/feed.xml",
+		"https://example.com/posts/second.html",
+		"https://example.com/posts/deep.html",
+	}
+
+	if got := urls(report); !slices.Equal(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeTreatsTheRootWithAndWithoutASlashAsOnePage(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com",
+		Depth: 3,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com":            {status: http.StatusOK, body: `<a href="/">home</a><a href="/about.html">about</a>`},
+			"https://example.com/":           {status: http.StatusOK, body: `<a href="/">home</a><a href="/about.html">about</a>`},
+			"https://example.com/about.html": {status: http.StatusOK, body: ""},
+		}, nil),
+	})
+
+	want := []string{"https://example.com", "https://example.com/about.html"}
+	if got := urls(report); !slices.Equal(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}

@@ -392,6 +392,16 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 		pages[i].Assets = c.assetsFor(refs[i])
 	}
 
+	// The order pages come back in depends on which worker finished first, so
+	// it is fixed here: nearer to the start page first, then by address.
+	slices.SortStableFunc(pages, func(a, b Page) int {
+		if a.Depth != b.Depth {
+			return a.Depth - b.Depth
+		}
+
+		return strings.Compare(a.URL, b.URL)
+	})
+
 	return pages
 }
 
