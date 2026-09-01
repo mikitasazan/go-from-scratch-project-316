@@ -1,6 +1,7 @@
 # Парсер сайтов (Go)
 
 [![hexlet-check](https://github.com/mikitasazan/go-from-scratch-project-316/actions/workflows/hexlet-check.yml/badge.svg)](https://github.com/mikitasazan/go-from-scratch-project-316/actions)
+[![checks](https://github.com/mikitasazan/go-from-scratch-project-316/actions/workflows/checks.yml/badge.svg)](https://github.com/mikitasazan/go-from-scratch-project-316/actions/workflows/checks.yml)
 
 Разработайте утилиту для обхода и анализа сайтов
 
@@ -9,30 +10,49 @@
 
 ## Стек
 
-- Go
+- Go 1.26, [urfave/cli](https://cli.urfave.org/) — разбор аргументов
+- Стандартный `net/http` — сетевой клиент передаётся снаружи, чтобы тесты
+  обходились без реальной сети
+- `golangci-lint`, GitHub Actions
 
 ## Установка
-
-<!-- Опишите установку: клонирование, зависимости, переменные окружения -->
 
 ```bash
 git clone https://github.com/mikitasazan/go-from-scratch-project-316.git
 cd go-from-scratch-project-316
+make build
 ```
 
 ## Использование
 
-<!-- Добавьте примеры запуска и запись asciinema — именно это смотрит работодатель -->
+```bash
+# обход сайта с настройками по умолчанию
+make run URL=https://example.com
 
----
+# или собранным бинарником
+bin/hexlet-go-crawler https://example.com
+bin/hexlet-go-crawler --depth 2 --workers 8 https://example.com
+```
 
-<details>
-<summary>Автоматические тесты Хекслета</summary>
+Без `URL` команда печатает справку и завершается кодом 0.
 
-Тесты запускаются на каждый коммит. За запуск отвечает файл `.github/workflows/hexlet-check.yml` — не удаляйте и не переименовывайте ни его, ни репозиторий.
+### Ключи
 
-</details>
+| Ключ | По умолчанию | Что делает |
+|---|---|---|
+| `--depth` | 10 | глубина обхода |
+| `--retries` | 1 | сколько раз повторить неудавшийся запрос |
+| `--delay` | 0s | пауза между запросами |
+| `--timeout` | 15s | таймаут одного запроса |
+| `--rps` | 0 | ограничение запросов в секунду, перебивает `--delay` |
+| `--user-agent` | — | свой User-Agent |
+| `--workers` | 4 | сколько запросов идёт параллельно |
 
-## О Хекслете
+## Команды
 
-[Хекслет](https://ru.hexlet.io/) — школа программирования: авторские программы обучения с практикой, поддержкой наставников и реальными проектами, которые остаются в резюме. Этот репозиторий — один из таких проектов.
+```bash
+make build   # собрать bin/hexlet-go-crawler
+make run URL=<адрес>
+make test    # прогнать тесты
+make lint    # golangci-lint
+```
