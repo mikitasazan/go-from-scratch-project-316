@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/urfave/cli/v3"
 
@@ -53,7 +52,8 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		URL:         url,
 		Depth:       cmd.Int("depth"),
 		Retries:     cmd.Int("retries"),
-		Delay:       delayFrom(cmd.Float("rps"), cmd.Duration("delay")),
+		Delay:       cmd.Duration("delay"),
+		RPS:         cmd.Float("rps"),
 		Timeout:     timeout,
 		UserAgent:   cmd.String("user-agent"),
 		Concurrency: cmd.Int("workers"),
@@ -74,14 +74,4 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	fmt.Println(string(report))
 
 	return nil
-}
-
-// delayFrom turns a requests-per-second limit into a pause between requests,
-// because that is the single knob the crawler itself understands.
-func delayFrom(rps float64, delay time.Duration) time.Duration {
-	if rps > 0 {
-		return time.Duration(float64(time.Second) / rps)
-	}
-
-	return delay
 }

@@ -35,6 +35,7 @@ type Options struct {
 	Depth       int
 	Retries     int
 	Delay       time.Duration
+	RPS         float64
 	Timeout     time.Duration
 	UserAgent   string
 	Concurrency int
@@ -83,9 +84,10 @@ func (p probe) broken() bool {
 // crawl holds the state of a single run: the client to use, the options it was
 // given, and what it has already asked about.
 type crawl struct {
-	opts   Options
-	client *http.Client
-	base   *url.URL
+	opts    Options
+	client  *http.Client
+	base    *url.URL
+	limiter *limiter
 
 	mu     sync.Mutex
 	probes map[string]probe
@@ -113,7 +115,12 @@ func newCrawl(opts Options) *crawl {
 		client = &http.Client{Timeout: opts.Timeout}
 	}
 
-	return &crawl{opts: opts, client: client, probes: map[string]probe{}}
+	return &crawl{
+		opts:    opts,
+		client:  client,
+		limiter: newLimiter(interval(opts.RPS, opts.Delay)),
+		probes:  map[string]probe{},
+	}
 }
 
 // request performs one HTTP call, retrying a request that never reached the
@@ -122,12 +129,8 @@ func (c *crawl) request(ctx context.Context, method, address string) (*http.Resp
 	var lastErr error
 
 	for attempt := 0; attempt <= c.opts.Retries; attempt++ {
-		if attempt > 0 && c.opts.Delay > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(c.opts.Delay):
-			}
+		if err := c.limiter.wait(ctx); err != nil {
+			return nil, err
 		}
 
 		request, err := http.NewRequestWithContext(ctx, method, address, nil)

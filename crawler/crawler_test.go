@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -577,5 +578,105 @@ func TestAnalyzeReturnsValidJSONWhenCancelled(t *testing.T) {
 
 	if report.RootURL != "https://example.com/" {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+// linkedSite builds a page linking to n others, so a crawl makes a known
+// number of requests.
+func linkedSite(n int) map[string]string {
+	pages := map[string]string{}
+
+	var links strings.Builder
+
+	for i := 1; i <= n; i++ {
+		target := fmt.Sprintf("https://example.com/%d", i)
+		fmt.Fprintf(&links, `<a href="%s">%d</a>`, target, i)
+		pages[target] = ""
+	}
+
+	pages["https://example.com/"] = links.String()
+
+	return pages
+}
+
+func TestAnalyzeSpacesRequestsByTheDelay(t *testing.T) {
+	const (
+		pages = 4
+		delay = 60 * time.Millisecond
+	)
+
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       2,
+		Concurrency: 4,
+		Delay:       delay,
+		HTTPClient:  site(linkedSite(pages), nil),
+	})
+
+	// Five addresses are fetched (the root and its four links), so at least
+	// four gaps must have been waited out even though four workers were free.
+	if elapsed := time.Since(start); elapsed < time.Duration(pages)*delay {
+		t.Fatalf("the crawl took %v, want at least %v", elapsed, time.Duration(pages)*delay)
+	}
+}
+
+func TestAnalyzeIsNotSlowedDownWithoutALimit(t *testing.T) {
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       2,
+		Concurrency: 4,
+		HTTPClient:  site(linkedSite(6), nil),
+	})
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("an unlimited crawl took %v", elapsed)
+	}
+}
+
+func TestRPSWinsOverDelay(t *testing.T) {
+	const pages = 3
+
+	start := time.Now()
+
+	analyze(t, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       2,
+		Concurrency: 4,
+		Delay:       2 * time.Second, // would make this test take seconds
+		RPS:         20,              // 50ms apart wins
+		HTTPClient:  site(linkedSite(pages), nil),
+	})
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("the crawl took %v — the delay was used instead of the rps", elapsed)
+	}
+}
+
+func TestCancellingStopsTheWaitAtOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+
+	if _, err := crawler.Analyze(ctx, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       2,
+		Concurrency: 1,
+		Delay:       10 * time.Second,
+		HTTPClient:  site(linkedSite(5), nil),
+	}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("cancelling left the crawl waiting for %v", elapsed)
 	}
 }
