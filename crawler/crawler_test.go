@@ -221,7 +221,6 @@ func TestAnalyzeFollowsLinksWithinTheSite(t *testing.T) {
 		"https://example.com/",
 		"https://example.com/one",
 		"https://example.com/two",
-		"https://other.test/x",
 		"https://example.com/deep",
 	}
 
@@ -298,31 +297,71 @@ func TestAnalyzeVisitsEachAddressOnce(t *testing.T) {
 	})
 }
 
-func TestAnalyzeRecordsABrokenLink(t *testing.T) {
+func TestAnalyzeKeepsOnlyTheBrokenLinks(t *testing.T) {
 	pages := map[string]string{
-		"https://example.com/": `<a href="/missing">gone</a>`,
+		"https://example.com/": `
+			<a href="/works">fine</a>
+			<a href="/missing">gone</a>
+			<a href="mailto:hi@example.com">write</a>
+			<a href="javascript:void(0)">nothing</a>
+			<a href="">empty</a>
+			<a href="#top">anchor</a>`,
+		"https://example.com/works": ``,
 	}
 
 	report := analyze(t, crawler.Options{
 		URL:        "https://example.com/",
-		Depth:      2,
+		Depth:      1,
 		HTTPClient: site(pages, nil),
 	})
 
-	var found bool
-
-	for _, page := range report.Pages {
-		if page.URL == "https://example.com/missing" {
-			found = true
-
-			if page.HTTPStatus != http.StatusNotFound || page.Status != "failed" {
-				t.Fatalf("broken link recorded as %+v", page)
-			}
-		}
+	broken := report.Pages[0].BrokenLinks
+	if len(broken) != 1 {
+		t.Fatalf("broken links = %+v, want exactly the missing one", broken)
 	}
 
-	if !found {
-		t.Fatal("the broken link is missing from the report")
+	if broken[0].URL != "https://example.com/missing" || broken[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("broken link = %+v", broken[0])
+	}
+}
+
+func TestAnalyzeRecordsANetworkErrorAsABrokenLink(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() == "https://example.com/" {
+			header := make(http.Header)
+			header.Set("Content-Type", "text/html")
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(`<a href="https://cdn.example.test/app.js">js</a>`)),
+				Header:     header,
+			}, nil
+		}
+
+		return nil, errors.New("dial tcp: lookup cdn.example.test: no such host")
+	})}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      1,
+		HTTPClient: client,
+	})
+
+	broken := report.Pages[0].BrokenLinks
+	if len(broken) != 1 || broken[0].Error == "" || broken[0].StatusCode != 0 {
+		t.Fatalf("broken links = %+v", broken)
+	}
+}
+
+func TestAnalyzeFillsDiscoveredAt(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, "", nil),
+	})
+
+	if _, err := time.Parse(time.RFC3339, report.Pages[0].DiscoveredAt); err != nil {
+		t.Fatalf("discovered_at = %q: %v", report.Pages[0].DiscoveredAt, err)
 	}
 }
 
