@@ -53,8 +53,8 @@ type Options struct {
 // server refused it (StatusCode) or the request never got through (Error).
 type BrokenLink struct {
 	URL        string `json:"url"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Error      string `json:"error,omitempty"`
+	StatusCode int    `json:"status_code"`
+	Error      string `json:"error"`
 }
 
 // Asset is one file a page pulls in, with what came back when it was asked for.
@@ -74,8 +74,8 @@ type Page struct {
 	Status       string       `json:"status"`
 	Error        string       `json:"error"`
 	SEO          SEO          `json:"seo"`
-	Assets       []Asset      `json:"assets"`
 	BrokenLinks  []BrokenLink `json:"broken_links"`
+	Assets       []Asset      `json:"assets"`
 	DiscoveredAt string       `json:"discovered_at"`
 }
 
@@ -645,6 +645,7 @@ func (c *crawl) brokenLinks(links []string) []BrokenLink {
 			entry.Error = result.err.Error()
 		} else {
 			entry.StatusCode = result.statusCode
+			entry.Error = http.StatusText(result.statusCode)
 		}
 
 		broken = append(broken, entry)

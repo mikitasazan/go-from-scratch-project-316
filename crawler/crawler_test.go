@@ -1,12 +1,14 @@
 package crawler_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1026,5 +1028,117 @@ func TestAnalyzeKeepsAssetsOutOfTheCrawl(t *testing.T) {
 
 	if got := urls(report); !slices.Equal(got, []string{"https://example.com/"}) {
 		t.Fatalf("pages = %v", got)
+	}
+}
+
+// referenceReport is the shape the project is graded against: every key is
+// present, in this order, whatever the crawl found.
+const referenceReport = `{
+  "root_url": "https://example.com",
+  "depth": 1,
+  "generated_at": "2024-06-01T12:34:56Z",
+  "pages": [
+    {
+      "url": "https://example.com",
+      "depth": 0,
+      "http_status": 200,
+      "status": "ok",
+      "error": "",
+      "seo": {
+        "has_title": true,
+        "title": "Example title",
+        "has_description": true,
+        "description": "Example description",
+        "has_h1": true
+      },
+      "broken_links": [
+        {
+          "url": "https://example.com/missing",
+          "status_code": 404,
+          "error": "Not Found"
+        }
+      ],
+      "assets": [
+        {
+          "url": "https://example.com/static/logo.png",
+          "type": "image",
+          "status_code": 200,
+          "size_bytes": 12345,
+          "error": ""
+        }
+      ],
+      "discovered_at": "2024-06-01T12:34:56Z"
+    }
+  ]
+}`
+
+// stampsFixed replaces the two generated timestamps with the reference one, so
+// a run can be compared byte for byte against a document written by hand.
+var stampsFixed = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})`)
+
+func referenceSite() *http.Client {
+	page := `<html><head>
+			<title>Example title</title>
+			<meta name="description" content="Example description">
+		</head><body>
+			<h1>Example</h1>
+			<a href="/missing">missing</a>
+			<img src="/static/logo.png">
+		</body></html>`
+
+	return resourceSite(map[string]resource{
+		"https://example.com":                 {status: http.StatusOK, body: page},
+		"https://example.com/missing":         {status: http.StatusNotFound},
+		"https://example.com/static/logo.png": {status: http.StatusOK, body: strings.Repeat("p", 12345), kind: "image/png"},
+	}, nil)
+}
+
+func TestAnalyzeMatchesTheReferenceReport(t *testing.T) {
+	raw, err := crawler.Analyze(context.Background(), crawler.Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		IndentJSON: true,
+		HTTPClient: referenceSite(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	got := stampsFixed.ReplaceAllString(string(raw), "2024-06-01T12:34:56Z")
+	if got != referenceReport {
+		t.Fatalf("report does not match the reference.\ngot:\n%s\nwant:\n%s", got, referenceReport)
+	}
+}
+
+func TestIndentJSONChangesOnlyTheSpacing(t *testing.T) {
+	run := func(indent bool) []byte {
+		t.Helper()
+
+		raw, err := crawler.Analyze(context.Background(), crawler.Options{
+			URL:        "https://example.com",
+			Depth:      1,
+			IndentJSON: indent,
+			HTTPClient: referenceSite(),
+		})
+		if err != nil {
+			t.Fatalf("Analyze: %v", err)
+		}
+
+		return []byte(stampsFixed.ReplaceAllString(string(raw), "2024-06-01T12:34:56Z"))
+	}
+
+	indented, plain := run(true), run(false)
+
+	if bytes.Equal(indented, plain) {
+		t.Fatal("IndentJSON did not change the formatting at all")
+	}
+
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, indented); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	if !bytes.Equal(compacted.Bytes(), plain) {
+		t.Fatalf("the two forms carry different documents.\nindented, compacted:\n%s\nplain:\n%s", compacted.Bytes(), plain)
 	}
 }
