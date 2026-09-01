@@ -1,5 +1,8 @@
 BINARY = bin/hexlet-go-crawler
 
+install:
+	go mod download
+
 build:
 	go build -o $(BINARY) ./cmd/hexlet-go-crawler
 
@@ -15,4 +18,4 @@ lint-fix:
 test:
 	go test ./...
 
-.PHONY: build run lint lint-fix test
+.PHONY: install build run lint lint-fix test
