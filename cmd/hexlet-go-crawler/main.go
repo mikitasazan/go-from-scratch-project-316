@@ -46,7 +46,13 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return cli.ShowAppHelp(cmd)
 	}
 
+	// A zero or negative value means "use the default", the same as in the
+	// library. Handing it straight to the client would make a hung server hang
+	// the whole crawl with no way out.
 	timeout := cmd.Duration("timeout")
+	if timeout <= 0 {
+		timeout = crawler.DefaultTimeout
+	}
 
 	report, err := crawler.Analyze(ctx, crawler.Options{
 		URL:         url,

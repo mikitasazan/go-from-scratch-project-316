@@ -1298,3 +1298,86 @@ func TestAnalyzeLeavesOutPagesItNeverAskedAbout(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzeCountsAPageMovedByARedirectOnce(t *testing.T) {
+	moved := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "text/html; charset=utf-8")
+
+		if r.URL.Path == "/blog" {
+			header.Set("Location", "/blog/")
+
+			return &http.Response{
+				Status:     http.StatusText(http.StatusMovedPermanently),
+				StatusCode: http.StatusMovedPermanently,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     header,
+				Request:    r,
+			}, nil
+		}
+
+		body := `<html><head><title>Home</title></head><body><a href="./">self</a></body></html>`
+
+		return &http.Response{
+			Status:     http.StatusText(http.StatusOK),
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     header,
+			Request:    r,
+		}, nil
+	})}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/blog",
+		Depth:      3,
+		HTTPClient: moved,
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/blog"}) {
+		t.Fatalf("the redirected page is in the report twice: %v", got)
+	}
+}
+
+func TestAnalyzeDoesNotCallALinkBrokenWhenItRanOutOfTime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	raw, err := crawler.Analyze(ctx, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       1,
+		Delay:       time.Hour,
+		Concurrency: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/": {status: http.StatusOK, body: `<a href="https://other.test/page">out</a>`},
+		}, nil),
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var report crawler.Report
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+
+	for _, page := range report.Pages {
+		if len(page.BrokenLinks) != 0 {
+			t.Fatalf("a link nobody checked is called broken: %+v", page.BrokenLinks)
+		}
+	}
+}
+
+func TestAnalyzeTreatsHostCaseAsTheSameAddress(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 3,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/": {status: http.StatusOK, body: `<a href="https://EXAMPLE.com/">same</a>`},
+			"https://EXAMPLE.com/": {status: http.StatusOK, body: `<a href="https://EXAMPLE.com/">same</a>`},
+		}, nil),
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/"}) {
+		t.Fatalf("the same page is in the report under two spellings: %v", got)
+	}
+}

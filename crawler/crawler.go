@@ -235,7 +235,10 @@ func pause(ctx context.Context, d time.Duration) error {
 // visit fetches one page of the site. A failure is a fact about the page, not a
 // reason to stop the crawl, so it comes back inside the Page. The parsed
 // document comes back alongside it, empty when there was nothing to read.
-func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, document) {
+// The address the page turned out to live at comes back as the third value: a
+// redirect moves it, and a walk that does not know that fetches the same
+// document again under its new name.
+func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, document, string) {
 	page := Page{
 		URL:          address,
 		Depth:        depth,
@@ -250,30 +253,30 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 		if errors.Is(err, errNotAttempted) {
 			// Nothing was asked, so there is nothing to report about this
 			// address. An empty status tells the caller to leave it out.
-			return Page{}, doc
+			return Page{}, doc, address
 		}
 
 		page.Error = err.Error()
 
-		return page, doc
+		return page, doc, address
 	}
 
 	defer func() { _ = response.Body.Close() }()
 
 	page.HTTPStatus = response.StatusCode
 
-	if response.StatusCode >= http.StatusBadRequest {
-		page.Error = response.Status
-		return page, doc
-	}
-
-	// After a redirect the page lives somewhere else, and its relative links
-	// point from there, not from the address that was asked for.
 	final := address
 	if response.Request != nil && response.Request.URL != nil {
 		final = response.Request.URL.String()
 	}
 
+	if response.StatusCode >= http.StatusBadRequest {
+		page.Error = response.Status
+		return page, doc, final
+	}
+
+	// After a redirect the page lives somewhere else, and its relative links
+	// point from there, not from the address that was asked for.
 	if base, err := url.Parse(final); err == nil {
 		doc = parseDocument(base, response.Body)
 	}
@@ -281,7 +284,7 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 	page.SEO = doc.seo
 	page.Status = statusOK
 
-	return page, doc
+	return page, doc, final
 }
 
 // probeLink asks whether an address answers, once per address per run. HEAD is
@@ -302,6 +305,12 @@ func (c *crawl) probeLink(ctx context.Context, address string) probe {
 	if result.statusCode == http.StatusMethodNotAllowed ||
 		result.statusCode == http.StatusNotImplemented {
 		result = c.askOnce(ctx, http.MethodGet, address)
+	}
+
+	// A check that never left says nothing about the address; caching it would
+	// turn "we ran out of time" into "this link is broken".
+	if errors.Is(result.err, errNotAttempted) {
+		return result
 	}
 
 	c.mu.Lock()
@@ -335,6 +344,8 @@ func canonical(raw string) string {
 		parsed.Path = "/"
 	}
 
+	parsed.Host = strings.ToLower(parsed.Host)
+
 	parsed.Fragment = ""
 
 	return parsed.String()
@@ -351,7 +362,7 @@ func now() string {
 func (c *crawl) run(ctx context.Context, root string) []Page {
 	base, err := url.Parse(root)
 	if err != nil {
-		page, _ := c.visit(ctx, root, 0)
+		page, _, _ := c.visit(ctx, root, 0)
 		return []Page{page}
 	}
 
@@ -388,8 +399,12 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 			refs = append(refs, result.doc.assets)
 
 			// What the crawl already learned about this address answers the
-			// link check for free, so nothing is fetched twice.
+			// link check for free, so nothing is fetched twice. The address
+			// the page ended up at counts as visited too, or a link pointing
+			// straight at it fetches the same document a second time.
 			c.remember(result.page)
+			c.rememberAt(result.final, result.page)
+			seen[canonical(result.final)] = struct{}{}
 
 			for _, link := range result.doc.links {
 				if !sameHost(base, link) {
@@ -446,6 +461,23 @@ func (c *crawl) remember(page Page) {
 
 	c.mu.Lock()
 	c.probes[canonical(page.URL)] = result
+	c.mu.Unlock()
+}
+
+// rememberAt records the same outcome under a second address — the one a
+// redirect landed on.
+func (c *crawl) rememberAt(address string, page Page) {
+	if address == "" || address == page.URL {
+		return
+	}
+
+	result := probe{statusCode: page.HTTPStatus}
+	if page.HTTPStatus == 0 && page.Error != "" {
+		result = probe{err: errors.New(page.Error)}
+	}
+
+	c.mu.Lock()
+	c.probes[canonical(address)] = result
 	c.mu.Unlock()
 }
 
@@ -519,6 +551,7 @@ type visited struct {
 	index int
 	page  Page
 	doc   document
+	final string
 }
 
 // fetchLevel runs one level of the walk through the worker pool and returns the
@@ -539,8 +572,8 @@ func (c *crawl) fetchLevel(ctx context.Context, level []string, depth int) []vis
 			defer wg.Done()
 
 			for i := range queue {
-				page, doc := c.visit(ctx, level[i], depth)
-				results <- visited{index: i, page: page, doc: doc}
+				page, doc, final := c.visit(ctx, level[i], depth)
+				results <- visited{index: i, page: page, doc: doc, final: final}
 			}
 		}()
 	}
@@ -611,7 +644,10 @@ func (c *crawl) fetchAssets(ctx context.Context, refs [][]assetRef) {
 			defer wg.Done()
 
 			for ref := range queue {
-				asset := c.fetchAsset(ctx, ref)
+				asset, asked := c.fetchAsset(ctx, ref)
+				if !asked {
+					continue
+				}
 
 				c.mu.Lock()
 				c.assets[ref.url] = asset
@@ -638,13 +674,18 @@ func (c *crawl) fetchAssets(ctx context.Context, refs [][]assetRef) {
 // fetchAsset measures one file. Content-Length is believed when it is there;
 // otherwise the body is read to the end and counted, because a size of zero
 // would be a claim, not a measurement.
-func (c *crawl) fetchAsset(ctx context.Context, ref assetRef) Asset {
+func (c *crawl) fetchAsset(ctx context.Context, ref assetRef) (Asset, bool) {
 	asset := Asset{URL: ref.url, Type: ref.kind}
 
 	response, err := c.request(ctx, http.MethodGet, ref.url)
 	if err != nil {
+		if errors.Is(err, errNotAttempted) {
+			return asset, false
+		}
+
 		asset.Error = err.Error()
-		return asset
+
+		return asset, true
 	}
 
 	defer func() { _ = response.Body.Close() }()
@@ -653,12 +694,12 @@ func (c *crawl) fetchAsset(ctx context.Context, ref assetRef) Asset {
 
 	if response.StatusCode >= http.StatusBadRequest {
 		asset.Error = response.Status
-		return asset
+		return asset, true
 	}
 
 	if response.ContentLength >= 0 {
 		asset.SizeBytes = response.ContentLength
-		return asset
+		return asset, true
 	}
 
 	size, err := io.Copy(io.Discard, response.Body)
@@ -666,12 +707,12 @@ func (c *crawl) fetchAsset(ctx context.Context, ref assetRef) Asset {
 		asset.SizeBytes = 0
 		asset.Error = err.Error()
 
-		return asset
+		return asset, true
 	}
 
 	asset.SizeBytes = size
 
-	return asset
+	return asset, true
 }
 
 // assetsFor collects one page's files from what the fetching pass measured.
