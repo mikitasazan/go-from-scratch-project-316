@@ -490,3 +490,92 @@ func TestAnalyzeTrimsWhitespaceInSEOText(t *testing.T) {
 		t.Fatalf("title = %q", title)
 	}
 }
+
+func TestAnalyzeAtDepthOneVisitsOnlyTheStartPage(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/":    `<a href="/one">1</a><a href="/two">2</a>`,
+		"https://example.com/one": ``,
+		"https://example.com/two": ``,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      1,
+		HTTPClient: site(pages, nil),
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/"}) {
+		t.Fatalf("visited %v, want only the start page", got)
+	}
+}
+
+func TestAnalyzeCountsDepthAsHopsFromTheStart(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/":         `<a href="/one">1</a><a href="https://other.test/x">out</a>`,
+		"https://example.com/one":      `<a href="/one/deep">deep</a>`,
+		"https://example.com/one/deep": ``,
+		"https://other.test/x":         ``,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      3,
+		HTTPClient: site(pages, nil),
+	})
+
+	want := map[string]int{
+		"https://example.com/":         0,
+		"https://example.com/one":      1,
+		"https://example.com/one/deep": 2,
+	}
+
+	if len(report.Pages) != len(want) {
+		t.Fatalf("visited %v, want %d pages", urls(report), len(want))
+	}
+
+	for _, page := range report.Pages {
+		if page.Depth != want[page.URL] {
+			t.Fatalf("%s has depth %d, want %d", page.URL, page.Depth, want[page.URL])
+		}
+	}
+}
+
+func TestAnalyzeListsADuplicatedLinkOnce(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/":    `<a href="/one">a</a><a href="/one">b</a><a href="/one#x">c</a>`,
+		"https://example.com/one": ``,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      3,
+		HTTPClient: site(pages, nil),
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/", "https://example.com/one"}) {
+		t.Fatalf("visited %v, want each address once", got)
+	}
+}
+
+func TestAnalyzeReturnsValidJSONWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	raw, err := crawler.Analyze(ctx, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      5,
+		HTTPClient: site(map[string]string{"https://example.com/": `<a href="/one">1</a>`}, nil),
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var report crawler.Report
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+
+	if report.RootURL != "https://example.com/" {
+		t.Fatalf("report = %+v", report)
+	}
+}

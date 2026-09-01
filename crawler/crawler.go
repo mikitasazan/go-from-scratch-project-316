@@ -256,6 +256,12 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 	)
 
 	for depth := 0; depth < c.opts.Depth && len(level) > 0; depth++ {
+		// A cancelled run keeps what it has instead of filling the report with
+		// pages that were never really fetched.
+		if ctx.Err() != nil {
+			break
+		}
+
 		results := c.fetchLevel(ctx, level, depth)
 
 		var next []string
