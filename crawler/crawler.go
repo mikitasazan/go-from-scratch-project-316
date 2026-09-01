@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +22,8 @@ const (
 	DefaultTimeout     = 15 * time.Second
 	DefaultConcurrency = 4
 
-	statusOK     = "ok"
-	statusFailed = "failed"
+	statusOK    = "ok"
+	statusError = "error"
 
 	// retryPause is the wait before another attempt. It is deliberately not
 	// zero: repeating instantly is another burst at a server that is already
@@ -63,7 +64,7 @@ type Asset struct {
 	Type       string `json:"type"`
 	StatusCode int    `json:"status_code"`
 	SizeBytes  int64  `json:"size_bytes"`
-	Error      string `json:"error"`
+	Error      string `json:"error,omitempty"`
 }
 
 // Page is one address the crawl visited.
@@ -72,7 +73,7 @@ type Page struct {
 	Depth        int          `json:"depth"`
 	HTTPStatus   int          `json:"http_status"`
 	Status       string       `json:"status"`
-	Error        string       `json:"error"`
+	Error        string       `json:"error,omitempty"`
 	SEO          SEO          `json:"seo"`
 	BrokenLinks  []BrokenLink `json:"broken_links"`
 	Assets       []Asset      `json:"assets"`
@@ -227,9 +228,7 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 	page := Page{
 		URL:          address,
 		Depth:        depth,
-		Status:       statusFailed,
-		Assets:       []Asset{},
-		BrokenLinks:  []BrokenLink{},
+		Status:       statusError,
 		DiscoveredAt: now(),
 	}
 
@@ -250,7 +249,7 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 		return page, doc
 	}
 
-	if base, err := url.Parse(address); err == nil && isHTML(response) {
+	if base, err := url.Parse(address); err == nil {
 		doc = parseDocument(base, response.Body)
 	}
 
@@ -264,8 +263,10 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 // enough for most servers; the ones that refuse the method are asked with GET,
 // because the step grades the answer and not how it was obtained.
 func (c *crawl) probeLink(ctx context.Context, address string) probe {
+	key := canonical(address)
+
 	c.mu.Lock()
-	cached, ok := c.probes[address]
+	cached, ok := c.probes[key]
 	c.mu.Unlock()
 
 	if ok {
@@ -279,7 +280,7 @@ func (c *crawl) probeLink(ctx context.Context, address string) probe {
 	}
 
 	c.mu.Lock()
-	c.probes[address] = result
+	c.probes[key] = result
 	c.mu.Unlock()
 
 	return result
@@ -296,10 +297,22 @@ func (c *crawl) askOnce(ctx context.Context, method, address string) probe {
 	return probe{statusCode: response.StatusCode}
 }
 
-// isHTML keeps the parser away from images and downloads, which are checked but
-// never read for links.
-func isHTML(response *http.Response) bool {
-	return strings.Contains(response.Header.Get("Content-Type"), "text/html")
+// canonical is the key one address is known by. A site answers the same page
+// for "http://a.test" and "http://a.test/", so both have to collapse into one
+// entry, or the report lists the front page twice.
+func canonical(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+
+	parsed.Fragment = ""
+
+	return parsed.String()
 }
 
 func now() string {
@@ -323,7 +336,7 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 		pages []Page
 		docs  [][]string
 		refs  [][]assetRef
-		seen  = map[string]struct{}{root: {}}
+		seen  = map[string]struct{}{canonical(root): {}}
 		level = []string{root}
 	)
 
@@ -352,11 +365,12 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 					continue
 				}
 
-				if _, already := seen[link]; already {
+				key := canonical(link)
+				if _, already := seen[key]; already {
 					continue
 				}
 
-				seen[link] = struct{}{}
+				seen[key] = struct{}{}
 				next = append(next, link)
 			}
 		}
@@ -368,6 +382,12 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 	c.fetchAssets(ctx, refs)
 
 	for i := range pages {
+		// A page that was never read has nothing to list, and an empty list
+		// would claim it was checked and came out clean.
+		if pages[i].Status != statusOK {
+			continue
+		}
+
 		pages[i].BrokenLinks = c.brokenLinks(docs[i])
 		pages[i].Assets = c.assetsFor(refs[i])
 	}
@@ -384,7 +404,7 @@ func (c *crawl) remember(page Page) {
 	}
 
 	c.mu.Lock()
-	c.probes[page.URL] = result
+	c.probes[canonical(page.URL)] = result
 	c.mu.Unlock()
 }
 
@@ -448,7 +468,7 @@ func (c *crawl) lookup(address string) (probe, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	result, ok := c.probes[address]
+	result, ok := c.probes[canonical(address)]
 
 	return result, ok
 }
@@ -625,6 +645,14 @@ func (c *crawl) assetsFor(refs []assetRef) []Asset {
 			out = append(out, asset)
 		}
 	}
+
+	slices.SortFunc(out, func(a, b Asset) int {
+		if a.Type != b.Type {
+			return strings.Compare(a.Type, b.Type)
+		}
+
+		return strings.Compare(a.URL, b.URL)
+	})
 
 	return out
 }

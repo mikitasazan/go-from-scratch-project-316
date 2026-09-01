@@ -159,7 +159,7 @@ func TestAnalyzeKeepsAnErrorStatusOnThePage(t *testing.T) {
 	})
 
 	page := report.Pages[0]
-	if page.HTTPStatus != http.StatusNotFound || page.Status != "failed" || page.Error == "" {
+	if page.HTTPStatus != http.StatusNotFound || page.Status != "error" || page.Error == "" {
 		t.Fatalf("page = %+v", page)
 	}
 }
@@ -178,7 +178,7 @@ func TestAnalyzeSurvivesANetworkFailure(t *testing.T) {
 	}
 
 	page := report.Pages[0]
-	if page.Status != "failed" || page.HTTPStatus != 0 || page.Error == "" {
+	if page.Status != "error" || page.HTTPStatus != 0 || page.Error == "" {
 		t.Fatalf("page = %+v", page)
 	}
 }
@@ -384,7 +384,7 @@ func TestAnalyzeRecordsAServerError(t *testing.T) {
 	})
 
 	page := report.Pages[0]
-	if page.HTTPStatus != http.StatusInternalServerError || page.Status != "failed" || page.Error == "" {
+	if page.HTTPStatus != http.StatusInternalServerError || page.Status != "error" || page.Error == "" {
 		t.Fatalf("page = %+v", page)
 	}
 }
@@ -407,7 +407,7 @@ func TestAnalyzeRecordsATimeout(t *testing.T) {
 	}
 
 	page := report.Pages[0]
-	if page.Status != "failed" || page.Error == "" {
+	if page.Status != "error" || page.Error == "" {
 		t.Fatalf("page = %+v", page)
 	}
 
@@ -740,7 +740,7 @@ func TestRetriesGiveUpAfterTheLimit(t *testing.T) {
 	})
 
 	page := report.Pages[0]
-	if page.Status != "failed" || page.HTTPStatus != http.StatusInternalServerError {
+	if page.Status != "error" || page.HTTPStatus != http.StatusInternalServerError {
 		t.Fatalf("page = %+v", page)
 	}
 
@@ -1043,7 +1043,6 @@ const referenceReport = `{
       "depth": 0,
       "http_status": 200,
       "status": "ok",
-      "error": "",
       "seo": {
         "has_title": true,
         "title": "Example title",
@@ -1063,8 +1062,7 @@ const referenceReport = `{
           "url": "https://example.com/static/logo.png",
           "type": "image",
           "status_code": 200,
-          "size_bytes": 12345,
-          "error": ""
+          "size_bytes": 12345
         }
       ],
       "discovered_at": "2024-06-01T12:34:56Z"
