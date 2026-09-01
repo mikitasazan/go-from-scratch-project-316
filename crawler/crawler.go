@@ -57,6 +57,15 @@ type BrokenLink struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// Asset is one file a page pulls in, with what came back when it was asked for.
+type Asset struct {
+	URL        string `json:"url"`
+	Type       string `json:"type"`
+	StatusCode int    `json:"status_code"`
+	SizeBytes  int64  `json:"size_bytes"`
+	Error      string `json:"error"`
+}
+
 // Page is one address the crawl visited.
 type Page struct {
 	URL          string       `json:"url"`
@@ -65,6 +74,7 @@ type Page struct {
 	Status       string       `json:"status"`
 	Error        string       `json:"error"`
 	SEO          SEO          `json:"seo"`
+	Assets       []Asset      `json:"assets"`
 	BrokenLinks  []BrokenLink `json:"broken_links"`
 	DiscoveredAt string       `json:"discovered_at"`
 }
@@ -97,6 +107,7 @@ type crawl struct {
 
 	mu     sync.Mutex
 	probes map[string]probe
+	assets map[string]Asset
 }
 
 func newCrawl(opts Options) *crawl {
@@ -126,6 +137,7 @@ func newCrawl(opts Options) *crawl {
 		client:  client,
 		limiter: newLimiter(interval(opts.RPS, opts.Delay)),
 		probes:  map[string]probe{},
+		assets:  map[string]Asset{},
 	}
 }
 
@@ -216,6 +228,7 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 		URL:          address,
 		Depth:        depth,
 		Status:       statusFailed,
+		Assets:       []Asset{},
 		BrokenLinks:  []BrokenLink{},
 		DiscoveredAt: now(),
 	}
@@ -309,6 +322,7 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 	var (
 		pages []Page
 		docs  [][]string
+		refs  [][]assetRef
 		seen  = map[string]struct{}{root: {}}
 		level = []string{root}
 	)
@@ -327,6 +341,7 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 		for _, result := range results {
 			pages = append(pages, result.page)
 			docs = append(docs, result.doc.links)
+			refs = append(refs, result.doc.assets)
 
 			// What the crawl already learned about this address answers the
 			// link check for free, so nothing is fetched twice.
@@ -350,9 +365,11 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 	}
 
 	c.probeUnknown(ctx, docs)
+	c.fetchAssets(ctx, refs)
 
 	for i := range pages {
 		pages[i].BrokenLinks = c.brokenLinks(docs[i])
+		pages[i].Assets = c.assetsFor(refs[i])
 	}
 
 	return pages
@@ -495,6 +512,117 @@ func (c *crawl) fetchLevel(ctx context.Context, level []string, depth int) []vis
 	for i, ok := range filled {
 		if ok {
 			out = append(out, ordered[i])
+		}
+	}
+
+	return out
+}
+
+// fetchAssets asks about every distinct file the site pulls in, once each, no
+// matter how many pages reference it.
+func (c *crawl) fetchAssets(ctx context.Context, refs [][]assetRef) {
+	pending := make([]assetRef, 0)
+	queued := map[string]struct{}{}
+
+	for _, list := range refs {
+		for _, ref := range list {
+			if _, already := queued[ref.url]; already {
+				continue
+			}
+
+			queued[ref.url] = struct{}{}
+			pending = append(pending, ref)
+		}
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	queue := make(chan assetRef)
+
+	var wg sync.WaitGroup
+
+	for range min(c.opts.Concurrency, len(pending)) {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for ref := range queue {
+				asset := c.fetchAsset(ctx, ref)
+
+				c.mu.Lock()
+				c.assets[ref.url] = asset
+				c.mu.Unlock()
+			}
+		}()
+	}
+
+	go func() {
+		defer close(queue)
+
+		for _, ref := range pending {
+			select {
+			case <-ctx.Done():
+				return
+			case queue <- ref:
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+// fetchAsset measures one file. Content-Length is believed when it is there;
+// otherwise the body is read to the end and counted, because a size of zero
+// would be a claim, not a measurement.
+func (c *crawl) fetchAsset(ctx context.Context, ref assetRef) Asset {
+	asset := Asset{URL: ref.url, Type: ref.kind}
+
+	response, err := c.request(ctx, http.MethodGet, ref.url)
+	if err != nil {
+		asset.Error = err.Error()
+		return asset
+	}
+
+	defer func() { _ = response.Body.Close() }()
+
+	asset.StatusCode = response.StatusCode
+
+	if response.StatusCode >= http.StatusBadRequest {
+		asset.Error = response.Status
+		return asset
+	}
+
+	if response.ContentLength >= 0 {
+		asset.SizeBytes = response.ContentLength
+		return asset
+	}
+
+	size, err := io.Copy(io.Discard, response.Body)
+	if err != nil {
+		asset.SizeBytes = 0
+		asset.Error = err.Error()
+
+		return asset
+	}
+
+	asset.SizeBytes = size
+
+	return asset
+}
+
+// assetsFor collects one page's files from what the fetching pass measured.
+func (c *crawl) assetsFor(refs []assetRef) []Asset {
+	out := make([]Asset, 0, len(refs))
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, ref := range refs {
+		if asset, ok := c.assets[ref.url]; ok {
+			out = append(out, asset)
 		}
 	}
 

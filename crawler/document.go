@@ -17,11 +17,18 @@ type SEO struct {
 	HasH1          bool   `json:"has_h1"`
 }
 
+// assetRef is a file a page pulls in — a picture, a script, a stylesheet.
+type assetRef struct {
+	url  string
+	kind string
+}
+
 // document is what one fetched page tells the crawler: the addresses it points
-// at and the tags a search engine reads.
+// at, the files it pulls in, and the tags a search engine reads.
 type document struct {
-	links []string
-	seo   SEO
+	links  []string
+	assets []assetRef
+	seo    SEO
 }
 
 // parseDocument reads an HTML body and resolves every href it finds against
@@ -33,8 +40,9 @@ func parseDocument(base *url.URL, body io.Reader) document {
 	}
 
 	var (
-		doc  document
-		seen = map[string]struct{}{}
+		doc        document
+		seen       = map[string]struct{}{}
+		seenAssets = map[string]struct{}{}
 	)
 
 	var walk func(*html.Node)
@@ -65,6 +73,14 @@ func parseDocument(base *url.URL, body io.Reader) document {
 				}
 			case "h1":
 				doc.seo.HasH1 = true
+			case "img":
+				addAsset(base, node, "src", assetImage, &doc, seenAssets)
+			case "script":
+				addAsset(base, node, "src", assetScript, &doc, seenAssets)
+			case "link":
+				if rel, ok := attr(node, "rel"); ok && strings.EqualFold(rel, "stylesheet") {
+					addAsset(base, node, "href", assetStyle, &doc, seenAssets)
+				}
 			}
 		}
 
@@ -76,6 +92,33 @@ func parseDocument(base *url.URL, body io.Reader) document {
 	walk(root)
 
 	return doc
+}
+
+// asset kinds, as the report spells them.
+const (
+	assetImage  = "image"
+	assetScript = "script"
+	assetStyle  = "style"
+)
+
+// addAsset records a file the page pulls in, once per address per page.
+func addAsset(base *url.URL, node *html.Node, attribute, kind string, doc *document, seen map[string]struct{}) {
+	value, ok := attr(node, attribute)
+	if !ok {
+		return
+	}
+
+	resolved, ok := resolve(base, value)
+	if !ok {
+		return
+	}
+
+	if _, already := seen[resolved]; already {
+		return
+	}
+
+	seen[resolved] = struct{}{}
+	doc.assets = append(doc.assets, assetRef{url: resolved, kind: kind})
 }
 
 // text collects the readable text inside a node. The parser has already turned

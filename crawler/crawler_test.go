@@ -826,3 +826,205 @@ func TestCancellingStopsFurtherAttempts(t *testing.T) {
 		t.Fatalf("made %d attempts after the cancel", got)
 	}
 }
+
+// resource is one thing the stub network can serve: a page or a file.
+type resource struct {
+	status  int
+	body    string
+	kind    string
+	unsized bool
+}
+
+// resourceSite answers from a fixed table and counts every request, so a test
+// can assert both what came back and how often the network was touched.
+func resourceSite(table map[string]resource, requests *sync.Map) *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		address := r.URL.String()
+
+		if requests != nil {
+			count, _ := requests.LoadOrStore(address, new(int64))
+			atomic.AddInt64(count.(*int64), 1)
+		}
+
+		item, ok := table[address]
+		if !ok {
+			item = resource{status: http.StatusNotFound, kind: "text/html; charset=utf-8"}
+		}
+
+		if item.kind == "" {
+			item.kind = "text/html; charset=utf-8"
+		}
+
+		header := make(http.Header)
+		header.Set("Content-Type", item.kind)
+
+		length := int64(len(item.body))
+		if item.unsized {
+			length = -1
+		}
+
+		return &http.Response{
+			Status:        http.StatusText(item.status),
+			StatusCode:    item.status,
+			Body:          io.NopCloser(strings.NewReader(item.body)),
+			Header:        header,
+			ContentLength: length,
+		}, nil
+	})}
+}
+
+func assetsOf(t *testing.T, report crawler.Report, address string) []crawler.Asset {
+	t.Helper()
+
+	for _, page := range report.Pages {
+		if page.URL == address {
+			return page.Assets
+		}
+	}
+
+	t.Fatalf("page %s is missing from the report", address)
+
+	return nil
+}
+
+func assetAt(t *testing.T, assets []crawler.Asset, address string) crawler.Asset {
+	t.Helper()
+
+	for _, asset := range assets {
+		if asset.URL == address {
+			return asset
+		}
+	}
+
+	t.Fatalf("asset %s is missing, got %+v", address, assets)
+
+	return crawler.Asset{}
+}
+
+func TestAnalyzeMeasuresEveryKindOfAsset(t *testing.T) {
+	page := `<html><body>
+		<img src="/logo.png">
+		<script src="/app.js"></script>
+		<link rel="stylesheet" href="/style.css">
+	</body></html>`
+
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":          {status: http.StatusOK, body: page},
+			"https://example.com/logo.png":  {status: http.StatusOK, body: strings.Repeat("p", 40), kind: "image/png"},
+			"https://example.com/app.js":    {status: http.StatusOK, body: strings.Repeat("j", 12), kind: "application/javascript"},
+			"https://example.com/style.css": {status: http.StatusOK, body: strings.Repeat("c", 7), kind: "text/css"},
+		}, nil),
+	})
+
+	assets := assetsOf(t, report, "https://example.com/")
+	if len(assets) != 3 {
+		t.Fatalf("assets = %+v", assets)
+	}
+
+	expected := []crawler.Asset{
+		{URL: "https://example.com/logo.png", Type: "image", StatusCode: 200, SizeBytes: 40},
+		{URL: "https://example.com/app.js", Type: "script", StatusCode: 200, SizeBytes: 12},
+		{URL: "https://example.com/style.css", Type: "style", StatusCode: 200, SizeBytes: 7},
+	}
+
+	for _, want := range expected {
+		got := assetAt(t, assets, want.URL)
+		if got != want {
+			t.Fatalf("asset %s = %+v, want %+v", want.URL, got, want)
+		}
+	}
+}
+
+func TestAnalyzeCountsAnUnsizedAssetByReadingIt(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":         {status: http.StatusOK, body: `<img src="/logo.png">`},
+			"https://example.com/logo.png": {status: http.StatusOK, body: strings.Repeat("p", 321), kind: "image/png", unsized: true},
+		}, nil),
+	})
+
+	asset := assetAt(t, assetsOf(t, report, "https://example.com/"), "https://example.com/logo.png")
+	if asset.SizeBytes != 321 || asset.Error != "" {
+		t.Fatalf("asset = %+v", asset)
+	}
+}
+
+func TestAnalyzeRecordsAnAssetThatAnswersWithAnError(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":         {status: http.StatusOK, body: `<img src="/gone.png"><img src="/broken.png">`},
+			"https://example.com/gone.png": {status: http.StatusNotFound, kind: "image/png"},
+			"https://example.com/broken.png": {
+				status: http.StatusInternalServerError, kind: "image/png",
+			},
+		}, nil),
+	})
+
+	assets := assetsOf(t, report, "https://example.com/")
+
+	gone := assetAt(t, assets, "https://example.com/gone.png")
+	if gone.StatusCode != http.StatusNotFound || gone.Error == "" || gone.SizeBytes != 0 {
+		t.Fatalf("gone = %+v", gone)
+	}
+
+	broken := assetAt(t, assets, "https://example.com/broken.png")
+	if broken.StatusCode != http.StatusInternalServerError || broken.Error == "" {
+		t.Fatalf("broken = %+v", broken)
+	}
+}
+
+func TestAnalyzeAsksAboutAnAssetSharedByTwoPagesOnlyOnce(t *testing.T) {
+	requests := new(sync.Map)
+
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 2,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":         {status: http.StatusOK, body: `<a href="/about">about</a><img src="/logo.png">`},
+			"https://example.com/about":    {status: http.StatusOK, body: `<img src="/logo.png">`},
+			"https://example.com/logo.png": {status: http.StatusOK, body: strings.Repeat("p", 55), kind: "image/png"},
+		}, requests),
+	})
+
+	count, ok := requests.Load("https://example.com/logo.png")
+	if !ok {
+		t.Fatal("the asset was never requested")
+	}
+
+	if got := atomic.LoadInt64(count.(*int64)); got != 1 {
+		t.Fatalf("the asset was requested %d times, want 1", got)
+	}
+
+	root := assetAt(t, assetsOf(t, report, "https://example.com/"), "https://example.com/logo.png")
+	about := assetAt(t, assetsOf(t, report, "https://example.com/about"), "https://example.com/logo.png")
+
+	if root != about {
+		t.Fatalf("the same asset reads differently on two pages: %+v vs %+v", root, about)
+	}
+
+	if root.SizeBytes != 55 {
+		t.Fatalf("asset = %+v", root)
+	}
+}
+
+func TestAnalyzeKeepsAssetsOutOfTheCrawl(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 3,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":         {status: http.StatusOK, body: `<img src="/logo.png">`},
+			"https://example.com/logo.png": {status: http.StatusOK, body: strings.Repeat("p", 5), kind: "image/png"},
+		}, nil),
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/"}) {
+		t.Fatalf("pages = %v", got)
+	}
+}
