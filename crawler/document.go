@@ -39,6 +39,10 @@ func parseDocument(base *url.URL, body io.Reader) document {
 		return document{}
 	}
 
+	if declared := baseHref(base, root); declared != nil {
+		base = declared
+	}
+
 	var (
 		doc        document
 		seen       = map[string]struct{}{}
@@ -78,7 +82,7 @@ func parseDocument(base *url.URL, body io.Reader) document {
 			case "script":
 				addAsset(base, node, "src", assetScript, &doc, seenAssets)
 			case "link":
-				if rel, ok := attr(node, "rel"); ok && strings.EqualFold(rel, "stylesheet") {
+				if rel, ok := attr(node, "rel"); ok && hasToken(rel, "stylesheet") {
 					addAsset(base, node, "href", assetStyle, &doc, seenAssets)
 				}
 			}
@@ -92,6 +96,38 @@ func parseDocument(base *url.URL, body io.Reader) document {
 	walk(root)
 
 	return doc
+}
+
+// baseHref finds the address the page itself declares as the starting point for
+// its relative links. HTML says a <base href> wins over the page's own address,
+// and a page served from one path but written for another relies on it.
+func baseHref(pageURL *url.URL, root *html.Node) *url.URL {
+	var found *url.URL
+
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if found != nil {
+			return
+		}
+
+		if node.Type == html.ElementNode && node.Data == "base" {
+			if href, ok := attr(node, "href"); ok {
+				if parsed, err := url.Parse(strings.TrimSpace(href)); err == nil {
+					found = pageURL.ResolveReference(parsed)
+				}
+			}
+
+			return
+		}
+
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+
+	walk(root)
+
+	return found
 }
 
 // asset kinds, as the report spells them.
@@ -147,6 +183,18 @@ func clean(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
+// hasToken says whether a space-separated attribute such as rel="preload
+// stylesheet" carries the word looked for.
+func hasToken(value, token string) bool {
+	for _, word := range strings.Fields(value) {
+		if strings.EqualFold(word, token) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func attr(node *html.Node, name string) (string, bool) {
 	for _, a := range node.Attr {
 		if a.Key == name {
@@ -189,5 +237,23 @@ func sameHost(base *url.URL, raw string) bool {
 		return false
 	}
 
-	return strings.EqualFold(parsed.Host, base.Host)
+	return hostKey(parsed) == hostKey(base)
+}
+
+// hostKey is the host as the site is identified by it. A port written out in
+// full — example.test:80 over http — names the same server as example.test, and
+// a crawl that treats them as two sites walks half of it as if it were foreign.
+func hostKey(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+
+	port := u.Port()
+	switch {
+	case port == "":
+	case u.Scheme == "http" && port == "80":
+	case u.Scheme == "https" && port == "443":
+	default:
+		host += ":" + port
+	}
+
+	return host
 }

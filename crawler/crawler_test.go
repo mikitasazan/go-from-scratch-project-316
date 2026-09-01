@@ -1186,3 +1186,115 @@ func TestAnalyzeTreatsTheRootWithAndWithoutASlashAsOnePage(t *testing.T) {
 		t.Fatalf("pages = %v, want %v", got, want)
 	}
 }
+
+func TestAnalyzeObeysADeclaredBase(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/shop/page.html",
+		Depth: 2,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/shop/page.html": {status: http.StatusOK, body: `
+				<html><head><base href="/docs/"></head>
+				<body><a href="guide.html">guide</a></body></html>`},
+			"https://example.com/docs/guide.html": {status: http.StatusOK, body: ""},
+		}, nil),
+	})
+
+	want := []string{"https://example.com/shop/page.html", "https://example.com/docs/guide.html"}
+	if got := urls(report); !slices.Equal(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeReadsAStylesheetAmongSeveralRelWords(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":          {status: http.StatusOK, body: `<link rel="preload stylesheet" href="/style.css">`},
+			"https://example.com/style.css": {status: http.StatusOK, body: "body{}", kind: "text/css"},
+		}, nil),
+	})
+
+	assets := assetsOf(t, report, "https://example.com/")
+	if len(assets) != 1 || assets[0].Type != "style" {
+		t.Fatalf("assets = %+v", assets)
+	}
+}
+
+func TestAnalyzeTreatsTheDefaultPortAsTheSameSite(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:   "http://example.com/",
+		Depth: 2,
+		HTTPClient: resourceSite(map[string]resource{
+			"http://example.com/":             {status: http.StatusOK, body: `<a href="http://example.com:80/page.html">page</a>`},
+			"http://example.com:80/page.html": {status: http.StatusOK, body: ""},
+		}, nil),
+	})
+
+	want := []string{"http://example.com/", "http://example.com:80/page.html"}
+	if got := urls(report); !slices.Equal(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeKeepsTheTypeOfTheTagThatNamedTheAsset(t *testing.T) {
+	requests := new(sync.Map)
+
+	report := analyze(t, crawler.Options{
+		URL:   "https://example.com/",
+		Depth: 2,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":           {status: http.StatusOK, body: `<a href="/other.html">o</a><img src="/thing">`},
+			"https://example.com/other.html": {status: http.StatusOK, body: `<script src="/thing"></script>`},
+			"https://example.com/thing":      {status: http.StatusOK, body: "x"},
+		}, requests),
+	})
+
+	root := assetAt(t, assetsOf(t, report, "https://example.com/"), "https://example.com/thing")
+	other := assetAt(t, assetsOf(t, report, "https://example.com/other.html"), "https://example.com/thing")
+
+	if root.Type != "image" || other.Type != "script" {
+		t.Fatalf("types = %q and %q", root.Type, other.Type)
+	}
+
+	count, _ := requests.Load("https://example.com/thing")
+	if got := atomic.LoadInt64(count.(*int64)); got != 1 {
+		t.Fatalf("the file was requested %d times, want 1", got)
+	}
+}
+
+func TestAnalyzeLeavesOutPagesItNeverAskedAbout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	raw, err := crawler.Analyze(ctx, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       3,
+		Delay:       time.Hour,
+		Concurrency: 1,
+		HTTPClient: resourceSite(map[string]resource{
+			"https://example.com/":       {status: http.StatusOK, body: `<a href="/a.html">a</a><a href="/b.html">b</a>`},
+			"https://example.com/a.html": {status: http.StatusOK, body: ""},
+			"https://example.com/b.html": {status: http.StatusOK, body: ""},
+		}, nil),
+	})
+
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var report crawler.Report
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+
+	if len(report.Pages) == 0 {
+		t.Fatal("the page that was fetched is missing from the report")
+	}
+
+	for _, page := range report.Pages {
+		if page.Status != "ok" {
+			t.Fatalf("a page nobody asked about is in the report: %+v", page)
+		}
+	}
+}

@@ -59,7 +59,9 @@ func (l *limiter) wait(ctx context.Context) error {
 // RPS wins when both are given, because it is the more specific instruction.
 func interval(rps float64, delay time.Duration) time.Duration {
 	if rps > 0 {
-		return time.Duration(float64(time.Second) / rps)
+		// A rate so high that the gap rounds down to nothing would switch the
+		// limiter off altogether, which is the opposite of what was asked.
+		return max(time.Duration(float64(time.Second)/rps), time.Nanosecond)
 	}
 
 	if delay > 0 {

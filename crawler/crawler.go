@@ -34,6 +34,10 @@ const (
 // ErrNoURL is returned when Options carries no address to start from.
 var ErrNoURL = errors.New("url is required")
 
+// errNotAttempted marks an address the run never actually asked about, because
+// it was cancelled while the address was still waiting its turn.
+var errNotAttempted = errors.New("request was not attempted")
+
 // Options carries everything one crawl run needs. HTTPClient is part of it on
 // purpose: the network is passed in, never reached for, so a test can hand the
 // crawler a client of its own.
@@ -155,6 +159,7 @@ func (c *crawl) request(ctx context.Context, method, address string) (*http.Resp
 	var (
 		lastResponse *http.Response
 		lastErr      error
+		attempts     int
 	)
 
 	for attempt := 0; attempt <= c.opts.Retries; attempt++ {
@@ -176,6 +181,8 @@ func (c *crawl) request(ctx context.Context, method, address string) (*http.Resp
 		if c.opts.UserAgent != "" {
 			request.Header.Set("User-Agent", c.opts.UserAgent)
 		}
+
+		attempts++
 
 		response, err := c.client.Do(request)
 		if err != nil {
@@ -202,6 +209,10 @@ func (c *crawl) request(ctx context.Context, method, address string) (*http.Resp
 	}
 
 	if lastErr == nil {
+		if attempts == 0 {
+			return nil, errNotAttempted
+		}
+
 		lastErr = ctx.Err()
 	}
 
@@ -236,7 +247,14 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 
 	response, err := c.request(ctx, http.MethodGet, address)
 	if err != nil {
+		if errors.Is(err, errNotAttempted) {
+			// Nothing was asked, so there is nothing to report about this
+			// address. An empty status tells the caller to leave it out.
+			return Page{}, doc
+		}
+
 		page.Error = err.Error()
+
 		return page, doc
 	}
 
@@ -249,7 +267,14 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 		return page, doc
 	}
 
-	if base, err := url.Parse(address); err == nil {
+	// After a redirect the page lives somewhere else, and its relative links
+	// point from there, not from the address that was asked for.
+	final := address
+	if response.Request != nil && response.Request.URL != nil {
+		final = response.Request.URL.String()
+	}
+
+	if base, err := url.Parse(final); err == nil {
 		doc = parseDocument(base, response.Body)
 	}
 
@@ -352,6 +377,12 @@ func (c *crawl) run(ctx context.Context, root string) []Page {
 		var next []string
 
 		for _, result := range results {
+			// A request that never left because the run was cancelled says
+			// nothing about the page; listing it as failed would be a claim.
+			if result.page.Status == "" {
+				continue
+			}
+
 			pages = append(pages, result.page)
 			docs = append(docs, result.doc.links)
 			refs = append(refs, result.doc.assets)
@@ -652,6 +683,10 @@ func (c *crawl) assetsFor(refs []assetRef) []Asset {
 
 	for _, ref := range refs {
 		if asset, ok := c.assets[ref.url]; ok {
+			// The measurement belongs to the address, the type to the tag that
+			// named it: the same file can be a picture on one page and a script
+			// on another, and it is still asked about once.
+			asset.Type = ref.kind
 			out = append(out, asset)
 		}
 	}
