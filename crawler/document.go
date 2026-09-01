@@ -8,10 +8,20 @@ import (
 	"golang.org/x/net/html"
 )
 
-// document is what one fetched page tells the crawler about the rest of the
-// site: the addresses it points at.
+// SEO is what a page says about itself to a search engine.
+type SEO struct {
+	HasTitle       bool   `json:"has_title"`
+	Title          string `json:"title"`
+	HasDescription bool   `json:"has_description"`
+	Description    string `json:"description"`
+	HasH1          bool   `json:"has_h1"`
+}
+
+// document is what one fetched page tells the crawler: the addresses it points
+// at and the tags a search engine reads.
 type document struct {
 	links []string
+	seo   SEO
 }
 
 // parseDocument reads an HTML body and resolves every href it finds against
@@ -29,14 +39,32 @@ func parseDocument(base *url.URL, body io.Reader) document {
 
 	var walk func(*html.Node)
 	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode && node.Data == "a" {
-			if href, ok := attr(node, "href"); ok {
-				if resolved, ok := resolve(base, href); ok {
-					if _, already := seen[resolved]; !already {
-						seen[resolved] = struct{}{}
-						doc.links = append(doc.links, resolved)
+		if node.Type == html.ElementNode {
+			switch node.Data {
+			case "a":
+				if href, ok := attr(node, "href"); ok {
+					if resolved, ok := resolve(base, href); ok {
+						if _, already := seen[resolved]; !already {
+							seen[resolved] = struct{}{}
+							doc.links = append(doc.links, resolved)
+						}
 					}
 				}
+			case "title":
+				// Only the first title counts; a second one is not a page title.
+				if !doc.seo.HasTitle {
+					doc.seo.HasTitle = true
+					doc.seo.Title = text(node)
+				}
+			case "meta":
+				if name, ok := attr(node, "name"); ok && strings.EqualFold(name, "description") {
+					if content, ok := attr(node, "content"); ok && !doc.seo.HasDescription {
+						doc.seo.HasDescription = true
+						doc.seo.Description = clean(content)
+					}
+				}
+			case "h1":
+				doc.seo.HasH1 = true
 			}
 		}
 
@@ -48,6 +76,32 @@ func parseDocument(base *url.URL, body io.Reader) document {
 	walk(root)
 
 	return doc
+}
+
+// text collects the readable text inside a node. The parser has already turned
+// entities such as &amp; back into their characters, so nothing else has to.
+func text(node *html.Node) string {
+	var b strings.Builder
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+
+	walk(node)
+
+	return clean(b.String())
+}
+
+// clean squeezes the whitespace a human would not have typed out of a value.
+func clean(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func attr(node *html.Node, name string) (string, bool) {

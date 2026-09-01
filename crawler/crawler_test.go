@@ -427,3 +427,66 @@ func TestAnalyzeNeverTouchesTheDefaultClient(t *testing.T) {
 		t.Fatalf("the injected client saw %d requests, want 1", len(calls))
 	}
 }
+
+func TestAnalyzeReadsTheSEOTags(t *testing.T) {
+	body := `<html><head>
+		<title>Example Test</title>
+		<meta name="description" content="A page about tea &amp; coffee">
+	</head><body><h1>Hello</h1></body></html>`
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, body, nil),
+	})
+
+	seo := report.Pages[0].SEO
+	if !seo.HasTitle || seo.Title != "Example Test" {
+		t.Fatalf("title = %q (has: %v)", seo.Title, seo.HasTitle)
+	}
+
+	if !seo.HasDescription || seo.Description != "A page about tea & coffee" {
+		t.Fatalf("description = %q (has: %v)", seo.Description, seo.HasDescription)
+	}
+
+	if !seo.HasH1 {
+		t.Fatal("h1 was not noticed")
+	}
+}
+
+func TestAnalyzeReportsMissingSEOTags(t *testing.T) {
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, `<html><body><p>bare</p></body></html>`, nil),
+	})
+
+	seo := report.Pages[0].SEO
+	if seo.HasTitle || seo.Title != "" || seo.HasDescription || seo.Description != "" || seo.HasH1 {
+		t.Fatalf("seo = %+v, want every flag false and every string empty", seo)
+	}
+}
+
+func TestAnalyzeDecodesHTMLEntitiesInTheTitle(t *testing.T) {
+	body := `<html><head><title>Tea &amp; Coffee &lt;shop&gt;</title></head><body></body></html>`
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, body, nil),
+	})
+
+	if title := report.Pages[0].SEO.Title; title != "Tea & Coffee <shop>" {
+		t.Fatalf("title = %q", title)
+	}
+}
+
+func TestAnalyzeTrimsWhitespaceInSEOText(t *testing.T) {
+	body := "<html><head><title>\n   Spaced   out\n  </title></head><body></body></html>"
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com",
+		HTTPClient: clientReturning(http.StatusOK, body, nil),
+	})
+
+	if title := report.Pages[0].SEO.Title; title != "Spaced out" {
+		t.Fatalf("title = %q", title)
+	}
+}

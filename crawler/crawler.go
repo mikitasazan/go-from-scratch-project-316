@@ -57,6 +57,7 @@ type Page struct {
 	HTTPStatus   int          `json:"http_status"`
 	Status       string       `json:"status"`
 	Error        string       `json:"error"`
+	SEO          SEO          `json:"seo"`
 	BrokenLinks  []BrokenLink `json:"broken_links"`
 	DiscoveredAt string       `json:"discovered_at"`
 }
@@ -182,6 +183,7 @@ func (c *crawl) visit(ctx context.Context, address string, depth int) (Page, doc
 		doc = parseDocument(base, response.Body)
 	}
 
+	page.SEO = doc.seo
 	page.Status = statusOK
 
 	return page, doc
