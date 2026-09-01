@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,13 +27,56 @@ func clientReturning(status int, body string, calls *[]*http.Request) *http.Clie
 			*calls = append(*calls, r)
 		}
 
+		header := make(http.Header)
+		header.Set("Content-Type", "text/html; charset=utf-8")
+
 		return &http.Response{
 			Status:     http.StatusText(status),
 			StatusCode: status,
 			Body:       io.NopCloser(strings.NewReader(body)),
-			Header:     make(http.Header),
+			Header:     header,
 		}, nil
 	})}
+}
+
+// site serves a small fixed set of pages, so a walk can be checked without a
+// server. A path that is not in the map answers 404.
+func site(pages map[string]string, requests *sync.Map) *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if requests != nil {
+			count, _ := requests.LoadOrStore(r.URL.String(), new(int64))
+			atomic.AddInt64(count.(*int64), 1)
+		}
+
+		header := make(http.Header)
+		header.Set("Content-Type", "text/html; charset=utf-8")
+
+		body, ok := pages[r.URL.String()]
+		if !ok {
+			return &http.Response{
+				Status:     http.StatusText(http.StatusNotFound),
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     header,
+			}, nil
+		}
+
+		return &http.Response{
+			Status:     http.StatusText(http.StatusOK),
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     header,
+		}, nil
+	})}
+}
+
+func urls(report crawler.Report) []string {
+	out := make([]string, 0, len(report.Pages))
+	for _, page := range report.Pages {
+		out = append(out, page.URL)
+	}
+
+	return out
 }
 
 func clientFailing(err error, calls *int) *http.Client {
@@ -153,5 +199,129 @@ func TestAnalyzeCanIndentTheReport(t *testing.T) {
 
 	if !strings.Contains(string(raw), "\n  \"root_url\"") {
 		t.Fatalf("report is not indented: %s", raw)
+	}
+}
+
+func TestAnalyzeFollowsLinksWithinTheSite(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/":     `<a href="/one">1</a> <a href="/two">2</a> <a href="https://other.test/x">out</a>`,
+		"https://example.com/one":  `<a href="/deep">deep</a>`,
+		"https://example.com/two":  ``,
+		"https://example.com/deep": ``,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      3,
+		HTTPClient: site(pages, nil),
+	})
+
+	got := urls(report)
+	want := []string{
+		"https://example.com/",
+		"https://example.com/one",
+		"https://example.com/two",
+		"https://other.test/x",
+		"https://example.com/deep",
+	}
+
+	if !slices.Equal(got, want) {
+		t.Fatalf("visited %v, want %v", got, want)
+	}
+
+	for _, page := range report.Pages {
+		if page.URL == "https://example.com/one" && page.Depth != 1 {
+			t.Fatalf("depth of /one = %d, want 1", page.Depth)
+		}
+	}
+}
+
+func TestAnalyzeStopsAtTheRequestedDepth(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/":    `<a href="/one">1</a>`,
+		"https://example.com/one": `<a href="/two">2</a>`,
+		"https://example.com/two": ``,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      2,
+		HTTPClient: site(pages, nil),
+	})
+
+	if got := urls(report); !slices.Equal(got, []string{"https://example.com/", "https://example.com/one"}) {
+		t.Fatalf("visited %v, want the root and one level below it", got)
+	}
+}
+
+func TestAnalyzeDoesNotFollowLinksOffTheSite(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/": `<a href="https://other.test/a">out</a>`,
+		"https://other.test/a": `<a href="https://other.test/b">deeper</a>`,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      5,
+		HTTPClient: site(pages, nil),
+	})
+
+	for _, page := range report.Pages {
+		if page.URL == "https://other.test/b" {
+			t.Fatal("the crawl descended into another host")
+		}
+	}
+}
+
+func TestAnalyzeVisitsEachAddressOnce(t *testing.T) {
+	var requests sync.Map
+
+	pages := map[string]string{
+		"https://example.com/":    `<a href="/one">1</a><a href="/one#top">again</a><a href="/two">2</a>`,
+		"https://example.com/one": `<a href="/">home</a><a href="/two">2</a>`,
+		"https://example.com/two": `<a href="/one">1</a>`,
+	}
+
+	analyze(t, crawler.Options{
+		URL:         "https://example.com/",
+		Depth:       5,
+		Concurrency: 4,
+		HTTPClient:  site(pages, &requests),
+	})
+
+	requests.Range(func(key, value any) bool {
+		if count := atomic.LoadInt64(value.(*int64)); count != 1 {
+			t.Errorf("%v fetched %d times, want once", key, count)
+		}
+
+		return true
+	})
+}
+
+func TestAnalyzeRecordsABrokenLink(t *testing.T) {
+	pages := map[string]string{
+		"https://example.com/": `<a href="/missing">gone</a>`,
+	}
+
+	report := analyze(t, crawler.Options{
+		URL:        "https://example.com/",
+		Depth:      2,
+		HTTPClient: site(pages, nil),
+	})
+
+	var found bool
+
+	for _, page := range report.Pages {
+		if page.URL == "https://example.com/missing" {
+			found = true
+
+			if page.HTTPStatus != http.StatusNotFound || page.Status != "failed" {
+				t.Fatalf("broken link recorded as %+v", page)
+			}
+		}
+	}
+
+	if !found {
+		t.Fatal("the broken link is missing from the report")
 	}
 }
